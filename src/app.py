@@ -5,19 +5,53 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
+from pydantic import BaseModel
+from starlette.middleware.sessions import SessionMiddleware
 import os
+import json
 from pathlib import Path
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
 
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=os.environ.get("SESSION_SECRET", "dev-session-secret-change-me")
+)
+
 # Mount the static files directory
 current_dir = Path(__file__).parent
 app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
           "static")), name="static")
+teachers_file = current_dir / "teachers.json"
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+def load_teachers() -> dict[str, str]:
+    """Load teacher credentials from JSON file."""
+    if not teachers_file.exists():
+        return {}
+
+    with open(teachers_file, "r", encoding="utf-8") as file:
+        return json.load(file)
+
+
+def require_teacher(request: Request) -> str:
+    """Ensure caller is an authenticated teacher and return username."""
+    username = request.session.get("teacher_username")
+    if not username:
+        raise HTTPException(
+            status_code=403,
+            detail="Only logged-in teachers can register or unregister students"
+        )
+    return username
 
 # In-memory activity database
 activities = {
@@ -88,9 +122,38 @@ def get_activities():
     return activities
 
 
+@app.get("/auth/status")
+def auth_status(request: Request):
+    username = request.session.get("teacher_username")
+    return {
+        "authenticated": bool(username),
+        "username": username
+    }
+
+
+@app.post("/auth/login")
+def login(payload: LoginRequest, request: Request):
+    teachers = load_teachers()
+    expected_password = teachers.get(payload.username)
+
+    if expected_password is None or expected_password != payload.password:
+        raise HTTPException(status_code=401, detail="Invalid teacher credentials")
+
+    request.session["teacher_username"] = payload.username
+    return {"message": f"Logged in as {payload.username}"}
+
+
+@app.post("/auth/logout")
+def logout(request: Request):
+    request.session.pop("teacher_username", None)
+    return {"message": "Logged out"}
+
+
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
+def signup_for_activity(activity_name: str, email: str, request: Request):
     """Sign up a student for an activity"""
+    require_teacher(request)
+
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
@@ -111,8 +174,10 @@ def signup_for_activity(activity_name: str, email: str):
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
+def unregister_from_activity(activity_name: str, email: str, request: Request):
     """Unregister a student from an activity"""
+    require_teacher(request)
+
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
